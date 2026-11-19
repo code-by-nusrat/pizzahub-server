@@ -2,7 +2,8 @@ import express from 'express'
 import cors from 'cors'
 import 'dotenv/config'
 import { MongoClient, ObjectId } from 'mongodb';
-import path from "path"
+import multer from 'multer';
+import path from "path";
 
 const app =express()
 const port =process.env.PORT ||5000
@@ -10,6 +11,20 @@ const port =process.env.PORT ||5000
 //middleware
 app.use(express.json());
 app.use(cors())
+
+// Menu images are uploaded to ImgBB, so the file is kept in memory only.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (!file.mimetype || !file.mimetype.startsWith("image/")) {
+      const error = new Error("Only image files (JPG, PNG, WebP) are allowed");
+      error.status = 400;
+      return cb(error);
+    }
+    cb(null, true);
+  },
+});
 
 
 //mongodb connection
@@ -167,6 +182,68 @@ app.put("/profile/:email", async (req, res) => {
 })
 
 
+// -----------------------------
+// menu image upload (ImgBB)
+
+// POST /upload
+// multipart/form-data with a single file field named "image".
+// The file is sent to ImgBB and the public URL is returned.
+app.post("/upload", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).send({
+        success: false,
+        message: "An image file is required",
+      })
+    }
+
+    const apiKey = process.env.IMGBB_API_KEY
+    if (!apiKey) {
+      return res.status(500).send({
+        success: false,
+        message: "ImgBB API key is not configured on the server",
+      })
+    }
+
+    const form = new URLSearchParams()
+    form.set("image", req.file.buffer.toString("base64"))
+
+    const imgbbResponse = await fetch(
+      `https://api.imgbb.com/1/upload?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        body: form,
+        signal: AbortSignal.timeout(30000),
+      }
+    )
+
+    const imgbbData = await imgbbResponse.json().catch(() => ({}))
+
+    if (!imgbbResponse.ok || !imgbbData?.success || !imgbbData?.data?.url) {
+      console.error("ImgBB upload error:", imgbbData)
+      return res.status(502).send({
+        success: false,
+        message:
+          imgbbData?.error?.message ||
+          "Image upload failed. Please try again.",
+      })
+    }
+
+    res.status(201).send({
+      success: true,
+      url: imgbbData.data.url,
+      display_url: imgbbData.data.display_url || imgbbData.data.url,
+      thumb: imgbbData.data.thumb?.url || imgbbData.data.url,
+    })
+  } catch (error) {
+    console.error("Image upload error:", error)
+    res.status(500).send({
+      success: false,
+      message: "Image upload failed",
+    })
+  }
+})
+
 //menu related api
 
 // app.get('/menu',async(req,res)=>{
@@ -233,35 +310,216 @@ app.get("/menu", async (req, res) => {
 })
 
 
+// app.post("/menu", async (req, res) => {
+//   try {
+//     const { name, category, description, price, location, image } = req.body
+
+//     const itemName = clean(name)
+//     const itemCategory = clean(category)
+//     const itemDescription = clean(description)
+//     const itemLocation = clean(location)
+//     const itemImage = clean(image)
+//     const itemPrice = Number(price)
+
+//     if (itemName.length < 3) {
+//       return res.status(400).send({
+//         success: false,
+//         message: "Item name must contain at least 3 characters",
+//       })
+//     }
+
+//     if (!itemCategory) {
+//       return res.status(400).send({
+//         success: false,
+//         message: "Category is required",
+//       })
+//     }
+
+//     if (!itemDescription) {
+//       return res.status(400).send({
+//         success: false,
+//         message: "Description is required",
+//       })
+//     }
+
+//     if (!Number.isFinite(itemPrice) || itemPrice <= 0) {
+//       return res.status(400).send({
+//         success: false,
+//         message: "Price must be a number greater than 0",
+//       })
+//     }
+
+//     if (!itemLocation) {
+//       return res.status(400).send({
+//         success: false,
+//         message: "Location is required",
+//       })
+//     }
+
+//     if (!itemImage) {
+//       return res.status(400).send({
+//         success: false,
+//         message: "Item image is required. Upload an image file first.",
+//       })
+//     }
+
+//     if (!/^https?:\/\/\S+$/i.test(itemImage)) {
+//       return res.status(400).send({
+//         success: false,
+//         message: "Item image must be a valid image URL",
+//       })
+//     }
+
+//     const menuData = {
+//       name: itemName,
+//       category: itemCategory,
+//       description: itemDescription,
+//       price: itemPrice,
+//       location: itemLocation,
+//       image: itemImage,
+//       approvalStatus: "pending",
+//       isAvailable: false,
+//       createdAt: new Date(),
+//     };
+
+//     const result = await menu.insertOne(menuData);
+
+//     res.status(201).send({
+//       success: true,
+//       message: "Menu item added successfully!",
+//       insertedId: result.insertedId,
+//       menu: menuData,
+//     });
+//   } catch (error) {
+//     console.error("Menu creation error:", error);
+//     res.status(500).send({ success: false, message: error.message });
+//   }
+// });
+
 app.post("/menu", async (req, res) => {
   try {
-    const { name, category, description, price, location, image } = req.body
-
-    const menuData = {
+    const {
       name,
       category,
       description,
-      price: Number(price),
+      price,
       location,
-      image: image || "",
+      image,
+      vendorEmail,
+    } = req.body
+
+    const itemName = clean(name)
+    const itemCategory = clean(category)
+    const itemDescription = clean(description)
+    const itemLocation = clean(location)
+    const itemImage = clean(image)
+    const email = clean(vendorEmail).toLowerCase()
+    const itemPrice = Number(price)
+
+    // Validate menu information
+    if (itemName.length < 3) {
+      return res.status(400).send({
+        success: false,
+        message: "Item name must contain at least 3 characters",
+      })
+    }
+
+    if (!itemCategory || !itemDescription || !itemLocation) {
+      return res.status(400).send({
+        success: false,
+        message: "Category, description and location are required",
+      })
+    }
+
+    if (!Number.isFinite(itemPrice) || itemPrice <= 0) {
+      return res.status(400).send({
+        success: false,
+        message: "Price must be greater than 0",
+      })
+    }
+
+    if (!itemImage || !/^https?:\/\/\S+$/i.test(itemImage)) {
+      return res.status(400).send({
+        success: false,
+        message: "A valid item image URL is required",
+      })
+    }
+
+    // Find vendor profile using email
+    if (!email) {
+      return res.status(400).send({
+        success: false,
+        message: "Vendor email is required",
+      })
+    }
+
+    const vendorProfile = await profile.findOne({ email })
+
+    if (!vendorProfile) {
+      return res.status(404).send({
+        success: false,
+        message: "Vendor profile not found. Please update your profile first.",
+      })
+    }
+
+    if (vendorProfile.role !== "vendor") {
+      return res.status(403).send({
+        success: false,
+        message: "Only vendors can add menu items",
+      })
+    }
+
+    if (!vendorProfile.businessName?.trim()) {
+      return res.status(400).send({
+        success: false,
+        message: "Please add your business name in Profile Settings first",
+      })
+    }
+
+    // Save menu item with vendor information
+    const menuData = {
+      name: itemName,
+      category: itemCategory,
+      description: itemDescription,
+      price: itemPrice,
+      location: itemLocation,
+      image: itemImage,
+
+      // Automatically added from vendor profile
+      vendorEmail: vendorProfile.email,
+      vendorName: vendorProfile.name || "",
+      businessName: vendorProfile.businessName,
+      businessLocation: vendorProfile.businessLocation || "",
+      openingHours: vendorProfile.openingHours || "",
+
       approvalStatus: "pending",
       isAvailable: false,
       createdAt: new Date(),
-    };
+    }
 
-    const result = await menu.insertOne(menuData);
+    const result = await menu.insertOne(menuData)
 
     res.status(201).send({
       success: true,
       message: "Menu item added successfully!",
       insertedId: result.insertedId,
-      menu: menuData,
-    });
+      menu: {
+        ...menuData,
+        _id: result.insertedId,
+      },
+    })
   } catch (error) {
-    console.error("Menu creation error:", error);
-    res.status(500).send({ success: false, message: error.message });
+    console.error("Menu creation error:", error)
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to create menu item",
+    })
   }
-});
+})
+
+
+
 app.put("/menu/:id", async (req, res) => {
   try {
     const { id } = req.params
@@ -364,6 +622,36 @@ app.get('/user',async(req,res)=>{
     const cursor =user.find({})
     const result =await cursor.toArray()
     res.send(result);
+})
+
+// Central error handler (file uploads, body parsing, etc.)
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    return next(error)
+  }
+
+  if (error instanceof multer.MulterError) {
+    return res.status(400).send({
+      success: false,
+      message:
+        error.code === "LIMIT_FILE_SIZE"
+          ? "Image must be 5 MB or smaller"
+          : error.message,
+    })
+  }
+
+  if (error.status === 400) {
+    return res.status(400).send({
+      success: false,
+      message: error.message,
+    })
+  }
+
+  console.error("Unhandled server error:", error)
+  res.status(500).send({
+    success: false,
+    message: "Server error",
+  })
 })
 
 app.listen(port,()=>{
