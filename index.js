@@ -1,71 +1,48 @@
 import express from 'express'
 import cors from 'cors'
 import 'dotenv/config'
-import { MongoClient, ObjectId } from 'mongodb';
-import multer from 'multer';
-import path from "path";
+import { MongoClient, ObjectId } from 'mongodb'
 
-const app =express()
-const port =process.env.PORT ||5000
+const app = express()
+const port = process.env.PORT || 5000
 
-//middleware
-app.use(express.json());
+// ---------- Middleware ----------
+app.use(express.json())
 app.use(cors())
 
-// Menu images are uploaded to ImgBB, so the file is kept in memory only.
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    if (!file.mimetype || !file.mimetype.startsWith("image/")) {
-      const error = new Error("Only image files (JPG, PNG, WebP) are allowed");
-      error.status = 400;
-      return cb(error);
-    }
-    cb(null, true);
-  },
-});
-
-
-//mongodb connection
-
-const client = new MongoClient(`mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.oborgny.mongodb.net/`);
+// ---------- MongoDB ----------
+const client = new MongoClient(
+  `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.oborgny.mongodb.net/`
+)
 
 export async function connectToMongoDB() {
   try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
+    await client.connect()
+    console.log("You successfully connected to MongoDB!")
+    return client
   } catch (err) {
-    console.dir(err);
+    console.dir(err)
   }
 }
 
-const connectedClient =await connectToMongoDB()
-const database =client.db("pizzahubdb")
-const user =database.collection("user")
-const menu =database.collection("menuData")
-const profile =database.collection("profile")
+await connectToMongoDB()
+const database = client.db("pizzahubdb")
+const user = database.collection("user")
+const menu = database.collection("menuData")
+const profile = database.collection("profile")
 
+// ---------- Helpers ----------
+const clean = (value) => (typeof value === "string" ? value.trim() : "")
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
-
-app.use("/uploads", express.static(path.join(process.cwd(), "uploads")))
-//-----------------------------
-//profile related api
-// app.get('/profile/:email',async(req,res)=>{
-//   const cursor =profile.find({})
-//     const result =await cursor.toArray()
-//     res.send(result);
-// })
-// GET one user's profile
+// ---------- Profile ----------
 app.get("/profile/:email", async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email).trim().toLowerCase()
 
     let result = await profile.findOne({ email })
 
-    // If profile collection doesn't contain the user,
-    // get the basic account information from user collection.
+    // Fall back to the basic account info in the user collection
     if (!result) {
       result = await user.findOne({ email })
     }
@@ -77,7 +54,6 @@ app.get("/profile/:email", async (req, res) => {
       })
     }
 
-    // Ensure all frontend fields have values
     const profileData = {
       ...result,
       name: result.name || "",
@@ -102,8 +78,6 @@ app.get("/profile/:email", async (req, res) => {
   }
 })
 
-
-// UPDATE user profile
 app.put("/profile/:email", async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email).trim().toLowerCase()
@@ -127,7 +101,7 @@ app.put("/profile/:email", async (req, res) => {
     }
 
     const existingProfile = await profile.findOne({ email })
-    const existingUser = existingProfile || await user.findOne({ email })
+    const existingUser = existingProfile || (await user.findOne({ email }))
 
     if (!existingUser) {
       return res.status(404).send({
@@ -181,84 +155,7 @@ app.put("/profile/:email", async (req, res) => {
   }
 })
 
-
-// -----------------------------
-// menu image upload (ImgBB)
-
-// POST /upload
-// multipart/form-data with a single file field named "image".
-// The file is sent to ImgBB and the public URL is returned.
-app.post("/upload", upload.single("image"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).send({
-        success: false,
-        message: "An image file is required",
-      })
-    }
-
-    const apiKey = process.env.IMGBB_API_KEY
-    if (!apiKey) {
-      return res.status(500).send({
-        success: false,
-        message: "ImgBB API key is not configured on the server",
-      })
-    }
-
-    const form = new URLSearchParams()
-    form.set("image", req.file.buffer.toString("base64"))
-
-    const imgbbResponse = await fetch(
-      `https://api.imgbb.com/1/upload?key=${encodeURIComponent(apiKey)}`,
-      {
-        method: "POST",
-        body: form,
-        signal: AbortSignal.timeout(30000),
-      }
-    )
-
-    const imgbbData = await imgbbResponse.json().catch(() => ({}))
-
-    if (!imgbbResponse.ok || !imgbbData?.success || !imgbbData?.data?.url) {
-      console.error("ImgBB upload error:", imgbbData)
-      return res.status(502).send({
-        success: false,
-        message:
-          imgbbData?.error?.message ||
-          "Image upload failed. Please try again.",
-      })
-    }
-
-    res.status(201).send({
-      success: true,
-      url: imgbbData.data.url,
-      display_url: imgbbData.data.display_url || imgbbData.data.url,
-      thumb: imgbbData.data.thumb?.url || imgbbData.data.url,
-    })
-  } catch (error) {
-    console.error("Image upload error:", error)
-    res.status(500).send({
-      success: false,
-      message: "Image upload failed",
-    })
-  }
-})
-
-//menu related api
-
-// app.get('/menu',async(req,res)=>{
-//     const query ={}
-//     console.log('query',req.query)
-//     if(req.query.category){
-//       query.category=req.query.category
-//     }
-//     const cursor = menu.find()
-//     const result = await cursor.toArray()
-//     res.send(result)
-// })
-const clean = (value) => (typeof value === "string" ? value.trim() : "")
-const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-
+// ---------- Menu ----------
 app.get("/menu", async (req, res) => {
   try {
     const query = {}
@@ -266,135 +163,45 @@ app.get("/menu", async (req, res) => {
     const name = clean(req.query.name)
     const category = clean(req.query.category)
     const location = clean(req.query.location)
+    const businessName = clean(req.query.businessName)
+    const approvalStatus = clean(req.query.approvalStatus)
 
-    console.log("Query:", req.query)
-
-    // Filter by name
     if (name) {
-      query.name = {
-        $regex: escapeRegex(name),
-        $options: "i",
-      }
+      query.name = { $regex: escapeRegex(name), $options: "i" }
     }
 
-    // Filter by category
     if (category) {
-      query.category = {
-        $regex: `^${escapeRegex(category)}$`,
+      query.category = { $regex: `^${escapeRegex(category)}$`, $options: "i" }
+    }
+
+    if (location) {
+      query.location = { $regex: escapeRegex(location), $options: "i" }
+    }
+
+    // Exact business match, case-insensitive
+    if (businessName) {
+      query.businessName = {
+        $regex: `^${escapeRegex(businessName)}$`,
         $options: "i",
       }
     }
 
-    // Filter by location
-    if (location) {
-      query.location = {
-        $regex: escapeRegex(location),
-        $options: "i",
-      }
+    if (approvalStatus) {
+      query.approvalStatus = approvalStatus
     }
 
     console.log("MongoDB filter:", query)
 
     const result = await menu.find(query).toArray()
-
     res.status(200).send(result)
-
   } catch (error) {
     console.error("Failed to fetch menu:", error)
-
     res.status(500).send({
       success: false,
       message: "Failed to fetch menu items",
     })
   }
 })
-
-
-// app.post("/menu", async (req, res) => {
-//   try {
-//     const { name, category, description, price, location, image } = req.body
-
-//     const itemName = clean(name)
-//     const itemCategory = clean(category)
-//     const itemDescription = clean(description)
-//     const itemLocation = clean(location)
-//     const itemImage = clean(image)
-//     const itemPrice = Number(price)
-
-//     if (itemName.length < 3) {
-//       return res.status(400).send({
-//         success: false,
-//         message: "Item name must contain at least 3 characters",
-//       })
-//     }
-
-//     if (!itemCategory) {
-//       return res.status(400).send({
-//         success: false,
-//         message: "Category is required",
-//       })
-//     }
-
-//     if (!itemDescription) {
-//       return res.status(400).send({
-//         success: false,
-//         message: "Description is required",
-//       })
-//     }
-
-//     if (!Number.isFinite(itemPrice) || itemPrice <= 0) {
-//       return res.status(400).send({
-//         success: false,
-//         message: "Price must be a number greater than 0",
-//       })
-//     }
-
-//     if (!itemLocation) {
-//       return res.status(400).send({
-//         success: false,
-//         message: "Location is required",
-//       })
-//     }
-
-//     if (!itemImage) {
-//       return res.status(400).send({
-//         success: false,
-//         message: "Item image is required. Upload an image file first.",
-//       })
-//     }
-
-//     if (!/^https?:\/\/\S+$/i.test(itemImage)) {
-//       return res.status(400).send({
-//         success: false,
-//         message: "Item image must be a valid image URL",
-//       })
-//     }
-
-//     const menuData = {
-//       name: itemName,
-//       category: itemCategory,
-//       description: itemDescription,
-//       price: itemPrice,
-//       location: itemLocation,
-//       image: itemImage,
-//       approvalStatus: "pending",
-//       isAvailable: false,
-//       createdAt: new Date(),
-//     };
-
-//     const result = await menu.insertOne(menuData);
-
-//     res.status(201).send({
-//       success: true,
-//       message: "Menu item added successfully!",
-//       insertedId: result.insertedId,
-//       menu: menuData,
-//     });
-//   } catch (error) {
-//     console.error("Menu creation error:", error);
-//     res.status(500).send({ success: false, message: error.message });
-//   }
-// });
 
 app.post("/menu", async (req, res) => {
   try {
@@ -405,7 +212,7 @@ app.post("/menu", async (req, res) => {
       price,
       location,
       image,
-      vendorEmail,
+      businessName,
     } = req.body
 
     const itemName = clean(name)
@@ -413,10 +220,9 @@ app.post("/menu", async (req, res) => {
     const itemDescription = clean(description)
     const itemLocation = clean(location)
     const itemImage = clean(image)
-    const email = clean(vendorEmail).toLowerCase()
     const itemPrice = Number(price)
+    const itemBusinessName = clean(businessName)
 
-    // Validate menu information
     if (itemName.length < 3) {
       return res.status(400).send({
         success: false,
@@ -424,74 +230,48 @@ app.post("/menu", async (req, res) => {
       })
     }
 
-    if (!itemCategory || !itemDescription || !itemLocation) {
-      return res.status(400).send({
-        success: false,
-        message: "Category, description and location are required",
-      })
+    if (!itemCategory) {
+      return res.status(400).send({ success: false, message: "Category is required" })
+    }
+
+    if (!itemDescription) {
+      return res.status(400).send({ success: false, message: "Description is required" })
     }
 
     if (!Number.isFinite(itemPrice) || itemPrice <= 0) {
       return res.status(400).send({
         success: false,
-        message: "Price must be greater than 0",
+        message: "Price must be a number greater than 0",
       })
     }
 
-    if (!itemImage || !/^https?:\/\/\S+$/i.test(itemImage)) {
+    if (!itemLocation) {
+      return res.status(400).send({ success: false, message: "Location is required" })
+    }
+
+    if (!itemImage) {
+      return res.status(400).send({ success: false, message: "Item image is required" })
+    }
+
+    if (!/^https?:\/\/\S+$/i.test(itemImage)) {
       return res.status(400).send({
         success: false,
-        message: "A valid item image URL is required",
+        message: "Item image must be a valid image URL",
       })
     }
 
-    // Find vendor profile using email
-    if (!email) {
-      return res.status(400).send({
-        success: false,
-        message: "Vendor email is required",
-      })
+    if (!itemBusinessName) {
+      return res.status(400).send({ success: false, message: "Business name is required" })
     }
 
-    const vendorProfile = await profile.findOne({ email })
-
-    if (!vendorProfile) {
-      return res.status(404).send({
-        success: false,
-        message: "Vendor profile not found. Please update your profile first.",
-      })
-    }
-
-    if (vendorProfile.role !== "vendor") {
-      return res.status(403).send({
-        success: false,
-        message: "Only vendors can add menu items",
-      })
-    }
-
-    if (!vendorProfile.businessName?.trim()) {
-      return res.status(400).send({
-        success: false,
-        message: "Please add your business name in Profile Settings first",
-      })
-    }
-
-    // Save menu item with vendor information
     const menuData = {
       name: itemName,
       category: itemCategory,
       description: itemDescription,
       price: itemPrice,
+      businessName: itemBusinessName,
       location: itemLocation,
       image: itemImage,
-
-      // Automatically added from vendor profile
-      vendorEmail: vendorProfile.email,
-      vendorName: vendorProfile.name || "",
-      businessName: vendorProfile.businessName,
-      businessLocation: vendorProfile.businessLocation || "",
-      openingHours: vendorProfile.openingHours || "",
-
       approvalStatus: "pending",
       isAvailable: false,
       createdAt: new Date(),
@@ -503,22 +283,16 @@ app.post("/menu", async (req, res) => {
       success: true,
       message: "Menu item added successfully!",
       insertedId: result.insertedId,
-      menu: {
-        ...menuData,
-        _id: result.insertedId,
-      },
+      menu: menuData,
     })
   } catch (error) {
     console.error("Menu creation error:", error)
-
     res.status(500).send({
       success: false,
-      message: "Failed to create menu item",
+      message: error.message,
     })
   }
 })
-
-
 
 app.put("/menu/:id", async (req, res) => {
   try {
@@ -539,17 +313,18 @@ app.put("/menu/:id", async (req, res) => {
     }
 
     // Only whitelisted fields can be changed
-    const updateDoc = {
-      $set: {
-        name: name.trim(),
-        price: Number(price),
-        location: location.trim(),
-        description: description.trim(),
-        updatedAt: new Date(),
-      },
-    }
-
-    const result = await menu.updateOne({ _id: new ObjectId(id) }, updateDoc)
+    const result = await menu.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          name: name.trim(),
+          price: Number(price),
+          location: location.trim(),
+          description: description.trim(),
+          updatedAt: new Date(),
+        },
+      }
+    )
 
     if (result.matchedCount === 0) {
       return res.status(404).send({ message: "Menu item not found" })
@@ -562,7 +337,6 @@ app.put("/menu/:id", async (req, res) => {
   }
 })
 
-// DELETE menu item
 app.delete("/menu/:id", async (req, res) => {
   try {
     const { id } = req.params
@@ -583,7 +357,6 @@ app.delete("/menu/:id", async (req, res) => {
   }
 })
 
-// CHANGE availability (used by the switch in the table)
 app.patch("/menu/:id/availability", async (req, res) => {
   try {
     const { id } = req.params
@@ -612,32 +385,20 @@ app.patch("/menu/:id/availability", async (req, res) => {
   }
 })
 
-app.get('/',(req,res)=>{
-    res.send('pizzahub is running')
+// ---------- Misc ----------
+app.get("/", (req, res) => {
+  res.send("pizzahub is running")
 })
 
-
-//find users
-app.get('/user',async(req,res)=>{
-    const cursor =user.find({})
-    const result =await cursor.toArray()
-    res.send(result);
+app.get("/user", async (req, res) => {
+  const result = await user.find({}).toArray()
+  res.send(result)
 })
 
-// Central error handler (file uploads, body parsing, etc.)
+// ---------- Error handler (must come after all routes) ----------
 app.use((error, req, res, next) => {
   if (res.headersSent) {
     return next(error)
-  }
-
-  if (error instanceof multer.MulterError) {
-    return res.status(400).send({
-      success: false,
-      message:
-        error.code === "LIMIT_FILE_SIZE"
-          ? "Image must be 5 MB or smaller"
-          : error.message,
-    })
   }
 
   if (error.status === 400) {
@@ -654,6 +415,7 @@ app.use((error, req, res, next) => {
   })
 })
 
-app.listen(port,()=>{
-    console.log(`pizzahub is running on port ${port}`)
+// ---------- Start (must be last) ----------
+app.listen(port, () => {
+  console.log(`pizzahub is running on port ${port}`)
 })
