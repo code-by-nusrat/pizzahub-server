@@ -30,6 +30,7 @@ const database = client.db("pizzahubdb")
 const user = database.collection("user")
 const menu = database.collection("menuData")
 const profile = database.collection("profile")
+const orders =database.collection('orders')
 
 // ---------- Helpers ----------
 const clean = (value) => (typeof value === "string" ? value.trim() : "")
@@ -156,24 +157,90 @@ app.put("/profile/:email", async (req, res) => {
 })
 
 // ---------- Menu ----------
+// app.get("/menu", async (req, res) => {
+//   try {
+//     const query = {}
+
+//     const name = clean(req.query.name)
+//     const category = clean(req.query.category)
+//     const location = clean(req.query.location)
+//     const businessName = clean(req.query.businessName)
+//     const approvalStatus = clean(req.query.approvalStatus)
+
+//     if (name) {
+//       query.name = { $regex: escapeRegex(name), $options: "i" }
+//     }
+
+//     if (category) {
+//       query.category = { $regex: `^${escapeRegex(category)}$`, $options: "i" }
+//     }
+
+//     if (location) {
+//       query.location = { $regex: escapeRegex(location), $options: "i" }
+//     }
+
+//     // Exact business match, case-insensitive
+//     if (businessName) {
+//       query.businessName = {
+//         $regex: `^${escapeRegex(businessName)}$`,
+//         $options: "i",
+//       }
+//     }
+
+//     if (approvalStatus) {
+//       query.approvalStatus = approvalStatus
+//     }
+
+//     console.log("MongoDB filter:", query)
+
+//     const result = await menu.find(query).toArray()
+//     res.status(200).send(result)
+//   } catch (error) {
+//     console.error("Failed to fetch menu:", error)
+//     res.status(500).send({
+//       success: false,
+//       message: "Failed to fetch menu items",
+//     })
+//   }
+// })
+
+
+// ---------- Helpers ----------
+
+// Only accept plain strings. Arrays and objects (e.g. ?name[$ne]=x) become "".
+
+// Make user text safe to use inside a regular expression
+
+
+// ---------- GET /menu ----------
+// Public menu list with optional filters:
+//   /menu?name=pepperoni&category=Pizza&location=Dhanmondi&businessName=Pizza%20Hub
 app.get("/menu", async (req, res) => {
   try {
-    const query = {}
+    // Public endpoint: only approved dishes are ever returned
+    const query = { approvalStatus: "approved" }
 
     const name = clean(req.query.name)
     const category = clean(req.query.category)
     const location = clean(req.query.location)
     const businessName = clean(req.query.businessName)
-    const approvalStatus = clean(req.query.approvalStatus)
 
+    // Every word typed must appear in the dish name, in any order
+    // "smoky supreme" matches "Smoky Pepperoni Supreme"
     if (name) {
-      query.name = { $regex: escapeRegex(name), $options: "i" }
+      query.$and = name
+        .split(/\s+/)
+        .map((word) => ({
+          name: { $regex: escapeRegex(word), $options: "i" },
+        }))
     }
 
+    // Exact category, case-insensitive
     if (category) {
       query.category = { $regex: `^${escapeRegex(category)}$`, $options: "i" }
     }
 
+    // Partial location match, case-insensitive
     if (location) {
       query.location = { $regex: escapeRegex(location), $options: "i" }
     }
@@ -186,13 +253,7 @@ app.get("/menu", async (req, res) => {
       }
     }
 
-    if (approvalStatus) {
-      query.approvalStatus = approvalStatus
-    }
-
-    console.log("MongoDB filter:", query)
-
-    const result = await menu.find(query).toArray()
+    const result = await menu.find(query).limit(200).toArray()
     res.status(200).send(result)
   } catch (error) {
     console.error("Failed to fetch menu:", error)
@@ -202,7 +263,6 @@ app.get("/menu", async (req, res) => {
     })
   }
 })
-
 app.post("/menu", async (req, res) => {
   try {
     const {
@@ -290,6 +350,105 @@ app.post("/menu", async (req, res) => {
     res.status(500).send({
       success: false,
       message: error.message,
+    })
+  }
+})
+
+//orderList related api
+app.post('/orders',async(rq,res)=>{
+ const order =req.body;
+ const result =await orders.insertOne(order)
+ res.send(result)
+})
+// ---------- GET /browse-menu ----------
+// Uses the `clean` and `escapeRegex` helpers already in your index.js.
+// Public menu list with optional filters:
+//   /browse-menu?name=Smoky%20pepperoni%20Supreme
+//   /browse-menu?name=pepperoni&category=Pizza&location=Dhanmondi
+app.get("/browse-menu", async (req, res) => {
+  try {
+    // Public endpoint: only approved dishes are ever returned
+    const query = { approvalStatus: "approved" }
+
+    const name = clean(req.query.name)
+    const category = clean(req.query.category)
+    const location = clean(req.query.location)
+    const businessName = clean(req.query.businessName)
+
+    // Every word typed must appear in the dish name, in any order
+    // "smoky supreme" matches "Smoky Pepperoni Supreme"
+    if (name) {
+      query.$and = name
+        .split(/\s+/)
+        .map((word) => ({
+          name: { $regex: escapeRegex(word), $options: "i" },
+        }))
+    }
+
+    // Exact category, case-insensitive
+    if (category) {
+      query.category = { $regex: `^${escapeRegex(category)}$`, $options: "i" }
+    }
+
+    // Partial location match, case-insensitive
+    if (location) {
+      query.location = { $regex: escapeRegex(location), $options: "i" }
+    }
+
+    // Exact business match, case-insensitive
+    if (businessName) {
+      query.businessName = {
+        $regex: `^${escapeRegex(businessName)}$`,
+        $options: "i",
+      }
+    }
+    const search = clean(req.query.search)
+
+    if (search) {
+      const regex = { $regex: escapeRegex(search), $options: "i" }
+
+      query.$or = [
+        { name: regex },
+        { category: regex },
+        { location: regex },
+        { businessName: regex },
+      ]
+    }
+    const result = await menu.find(query).limit(200).toArray()
+    res.status(200).send(result)
+  } catch (error) {
+    console.error("Failed to fetch menu:", error)
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch menu items",
+    })
+  }
+})
+// ---------- GET /browse-menu/:id ----------
+// One approved dish, used by the details page
+app.get("/browse-menu/:id", async (req, res) => {
+  try {
+    const { id } = req.params
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ success: false, message: "Invalid item id" })
+    }
+
+    const item = await menu.findOne({
+      _id: new ObjectId(id),
+      approvalStatus: "approved",
+    })
+
+    if (!item) {
+      return res.status(404).send({ success: false, message: "Item not found" })
+    }
+
+    res.status(200).send(item)
+  } catch (error) {
+    console.error("Failed to fetch menu item:", error)
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch menu item",
     })
   }
 })
