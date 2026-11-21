@@ -2,6 +2,9 @@ import express from 'express'
 import cors from 'cors'
 import 'dotenv/config'
 import { MongoClient, ObjectId } from 'mongodb'
+import Stripe from 'stripe'
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 
 const app = express()
 const port = process.env.PORT || 5000
@@ -30,11 +33,41 @@ const database = client.db("pizzahubdb")
 const user = database.collection("user")
 const menu = database.collection("menuData")
 const profile = database.collection("profile")
-const orders =database.collection('orders')
+const orders = database.collection('orders')
+const payments = database.collection('payments')
+// Read-only payment history shown to admins and vendors
+const transactions = database.collection('transactions')
 
 // ---------- Helpers ----------
 const clean = (value) => (typeof value === "string" ? value.trim() : "")
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+
+// Free vendors can publish this many active (available) menu items
+const FREE_ACTIVE_ITEM_LIMIT = 3
+
+// A business is premium when the account that owns it has premium: true.
+// Business names live on the profile, accounts live in the user collection.
+async function findBusinessOwner(businessName) {
+  const name = clean(businessName)
+  if (!name) return null
+
+  const profileDoc = await profile.findOne({
+    businessName: { $regex: `^${escapeRegex(name)}$`, $options: "i" },
+  })
+
+  const email = (profileDoc?.email || "").toLowerCase()
+  if (!email) return null
+
+  const account = await user.findOne({ email })
+  if (!account) return null
+
+  return { profile: profileDoc, account }
+}
+
+async function isPremiumBusiness(businessName) {
+  const owner = await findBusinessOwner(businessName)
+  return Boolean(owner?.account?.premium)
+}
 
 // ---------- Profile ----------
 app.get("/profile/:email", async (req, res) => {
@@ -75,6 +108,40 @@ app.get("/profile/:email", async (req, res) => {
     res.status(500).send({
       success: false,
       message: "Failed to load profile",
+    })
+  }
+})
+
+// ---------- Subscription ----------
+// Reads the premium flag that /payments/checkout-verify writes after a
+// successful Stripe payment. Only a boolean is returned.
+app.get("/subscription/:email", async (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email).trim().toLowerCase()
+
+    const account = await user.findOne(
+      { email },
+      { projection: { premium: 1 } }
+    )
+
+    if (!account) {
+      return res.status(404).send({
+        success: false,
+        message: "Account not found",
+      })
+    }
+
+    res.status(200).send({
+      email,
+      premium: Boolean(account.premium),
+      plan: account.premium ? "Premium" : "Free",
+      activeItemLimit: account.premium ? null : FREE_ACTIVE_ITEM_LIMIT,
+    })
+  } catch (error) {
+    console.error("Get subscription error:", error)
+    res.status(500).send({
+      success: false,
+      message: "Failed to load subscription",
     })
   }
 })
@@ -217,8 +284,21 @@ app.put("/profile/:email", async (req, res) => {
 //   /menu?name=pepperoni&category=Pizza&location=Dhanmondi&businessName=Pizza%20Hub
 app.get("/menu", async (req, res) => {
   try {
-    // Public endpoint: only approved dishes are ever returned
-    const query = { approvalStatus: "approved" }
+    // Public visitors only see approved dishes. Vendor dashboards need their
+    // pending/rejected items too, so approval is filtered only when asked:
+    //   /menu?approvalStatus=approved | pending | rejected
+    //   /menu?approvalStatus=all -> every status
+    const query = {}
+
+    const approvalStatus = clean(req.query.approvalStatus)
+    if (approvalStatus === "all") {
+      // no approval filter
+    } else if (approvalStatus) {
+      query.approvalStatus = approvalStatus
+    } else {
+      // Default: only approved dishes are ever returned
+      query.approvalStatus = "approved"
+    }
 
     const name = clean(req.query.name)
     const category = clean(req.query.category)
@@ -355,11 +435,233 @@ app.post("/menu", async (req, res) => {
 })
 
 //orderList related api
-app.post('/orders',async(rq,res)=>{
- const order =req.body;
- const result =await orders.insertOne(order)
- res.send(result)
+app.post('/orders', async (req, res) => {
+  try {
+    const order = req.body
+    if (
+      !order ||
+      typeof order !== 'object' ||
+      Array.isArray(order) ||
+      Object.keys(order).length === 0
+    ) {
+      return res.status(400).send({ success: false, message: 'Order data is required' })
+    }
+
+    const result = await orders.insertOne({
+      ...order,
+      createdAt: order.createdAt ? new Date(order.createdAt) : new Date(),
+    })
+
+    res.status(201).send({ success: true, insertedId: result.insertedId })
+  } catch (error) {
+    console.error('Order creation failed:', error)
+    res.status(500).send({ success: false, message: 'Failed to place order' })
+  }
 })
+
+//payment related api
+// Verifies a Stripe Checkout session after a successful payment:
+//   1. the session is complete and paid
+//   2. the transaction has not been saved before (a page refresh must not insert twice)
+//   3. the transaction is stored in the read-only `transactions` collection
+//   4. the subscription is upgraded only after that verified confirmation
+app.post('/payments/checkout-verify', async (req, res) => {
+  try {
+    const sessionId = clean(req.body?.sessionId)
+
+    if (!sessionId) {
+      return res.status(400).send({
+        success: false,
+        message: 'sessionId is required',
+      })
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId)
+    const {
+      status,
+      payment_status,
+      customer,
+      customer_email,
+      metadata,
+      subscription,
+      amount_total,
+      currency,
+    } = session
+
+    if (status !== 'complete' || payment_status !== 'paid') {
+      return res.status(400).send({
+        success: false,
+        message: 'Payment is not complete',
+      })
+    }
+
+    const userId = clean(metadata?.userId)
+    if (!userId) {
+      return res.status(400).send({
+        success: false,
+        message: 'No user on this payment',
+      })
+    }
+
+    // A page refresh must not save the same transaction twice
+    const existing = await transactions.findOne({ sessionId })
+    if (existing) {
+      return res.send({
+        success: true,
+        alreadyProcessed: true,
+        transaction: existing,
+      })
+    }
+
+    // Vendor details: the account that paid -> its business profile
+    const accountQuery = ObjectId.isValid(userId)
+      ? { _id: new ObjectId(userId) }
+      : { id: userId }
+
+    const account = await user.findOne(accountQuery)
+    const email = (account?.email || customer_email || '').toLowerCase()
+    const profileDoc = email ? await profile.findOne({ email }) : null
+
+    const vendorName =
+      profileDoc?.businessName || account?.name || email || 'Vendor'
+
+    const transaction = {
+      sessionId,
+      userId,
+      vendorName,
+      vendorEmail: email,
+      plan: 'Premium',
+      premium: true,
+      amount:
+        typeof amount_total === 'number'
+          ? Number((amount_total / 100).toFixed(2))
+          : 0,
+      currency: (currency || 'usd').toUpperCase(),
+      status,
+      payment_status,
+      stripeCustomerId:
+        typeof customer === 'string' ? customer : customer?.id || null,
+      subscriptionId:
+        typeof subscription === 'string' ? subscription : subscription?.id || null,
+      payment_date: new Date(),
+      createdAt: new Date(),
+    }
+
+    const result = await transactions.insertOne(transaction)
+
+    // Upgrade the account only after Stripe confirmed the payment
+    if (account) {
+      await user.updateOne(accountQuery, {
+        $set: { premium: true, plan: 'premium', updatedAt: new Date() },
+      })
+    }
+
+    res.send({
+      success: true,
+      insertedId: result.insertedId,
+      transaction: { ...transaction, _id: result.insertedId },
+    })
+  } catch (error) {
+    console.error('Checkout verify failed:', error)
+    res.status(500).send({
+      success: false,
+      message: 'Payment verification failed',
+    })
+  }
+})
+
+// ---------- GET /transactions ----------
+// Payment history. Read-only by design: there is deliberately no POST, PUT,
+// PATCH or DELETE route for transactions, so records cannot be edited.
+//   /transactions                        -> every transaction (admin view)
+//   /transactions?vendorEmail=x@y.com    -> one vendor's history
+app.get('/transactions', async (req, res) => {
+  try {
+    const query = {}
+
+    const vendorEmail = clean(req.query.vendorEmail)
+    const userId = clean(req.query.userId)
+    const paymentStatus = clean(req.query.paymentStatus)
+
+    if (vendorEmail) {
+      query.vendorEmail = {
+        $regex: `^${escapeRegex(vendorEmail)}$`,
+        $options: 'i',
+      }
+    }
+
+    if (userId) {
+      query.userId = userId
+    }
+
+    if (paymentStatus) {
+      query.payment_status = paymentStatus
+    }
+
+    const result = await transactions
+      .find(query)
+      .sort({ payment_date: -1 })
+      .limit(200)
+      .toArray()
+
+    res.status(200).send(result)
+  } catch (error) {
+    console.error('Failed to fetch transactions:', error)
+    res.status(500).send({
+      success: false,
+      message: 'Failed to fetch transactions',
+    })
+  }
+})
+// app.post("/payments/checkout-verify", async (req, res) => {
+//   try {
+//     const sessionId = clean(req.body.sessionId)
+//     if (!sessionId) {
+//       return res.status(400).send({ success: false, message: "sessionId is required" })
+//     }
+
+//     const session = await stripe.checkout.sessions.retrieve(sessionId)
+//     const { status, payment_status, customer, customer_email, metadata, subscription } = session
+
+//     if (status !== "complete" || payment_status !== "paid") {
+//       return res.status(400).send({ success: false, message: "Payment not completed" })
+//     }
+
+//     const userId = metadata?.userId
+//     if (!userId) {
+//       return res.status(400).send({ success: false, message: "No user on this payment" })
+//     }
+
+//     // Already processed? A page refresh must not insert twice.
+//     if (await payments.findOne({ sessionId })) {
+//       return res.send({ success: true, alreadyProcessed: true })
+//     }
+
+//     const result = await payments.insertOne({
+//       sessionId,
+//       status,
+//       payment_status,
+//       customer,
+//       customer_email,
+//       userId,
+//       subscription,
+//       payment_date: new Date(),
+//     })
+
+//     const query = ObjectId.isValid(userId) ? { _id: new ObjectId(userId) } : { id: userId }
+//     await user.updateOne(query, { $set: { premium: true, updatedAt: new Date() } })
+
+//     res.send({ success: true, insertedId: result.insertedId })
+//   } catch (error) {
+//     console.error("Checkout verify failed:", error)
+//     res.status(500).send({ success: false, message: "Payment verification failed" })
+//   }
+// })
+
+
+
+
+
 // ---------- GET /browse-menu ----------
 // Uses the `clean` and `escapeRegex` helpers already in your index.js.
 // Public menu list with optional filters:
@@ -526,6 +828,48 @@ app.patch("/menu/:id/availability", async (req, res) => {
     }
     if (typeof isAvailable !== "boolean") {
       return res.status(400).send({ message: "isAvailable must be true or false" })
+    }
+
+    const item = await menu.findOne({ _id: new ObjectId(id) })
+
+    if (!item) {
+      return res.status(404).send({ message: "Menu item not found" })
+    }
+
+    // Publishing rules only matter when an item is being turned on
+    if (isAvailable) {
+      // Only approved dishes can be published
+      if (item.approvalStatus !== "approved") {
+        return res.status(400).send({
+          success: false,
+          message: "This item must be approved before it can be published.",
+        })
+      }
+
+      // Free vendors can publish at most FREE_ACTIVE_ITEM_LIMIT active items.
+      // Premium vendors have no limit.
+      const premium = await isPremiumBusiness(item.businessName)
+
+      if (!premium) {
+        const activeItems = await menu.countDocuments({
+          businessName: {
+            $regex: `^${escapeRegex(clean(item.businessName))}$`,
+            $options: "i",
+          },
+          isAvailable: true,
+          _id: { $ne: item._id },
+        })
+
+        if (activeItems >= FREE_ACTIVE_ITEM_LIMIT) {
+          return res.status(403).send({
+            success: false,
+            code: "PREMIUM_REQUIRED",
+            message: `Free vendors can publish up to ${FREE_ACTIVE_ITEM_LIMIT} active items. Upgrade to Premium to publish more.`,
+            activeItems,
+            limit: FREE_ACTIVE_ITEM_LIMIT,
+          })
+        }
+      }
     }
 
     const result = await menu.updateOne(
