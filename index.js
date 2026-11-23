@@ -1,4 +1,3 @@
-
 import express from 'express'
 import cors from 'cors'
 import 'dotenv/config'
@@ -11,13 +10,23 @@ const app = express()
 const port = process.env.PORT || 5000
 
 // ---------- Middleware ----------
-app.use(express.json())
-app.use(cors())
+app.use(express.json({ limit: "100kb" }))
+// Only the Next.js app may call this API from a browser
+app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000" }))
 
 // ---------- MongoDB ----------
 const client = new MongoClient(
   `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.oborgny.mongodb.net/`
 )
+
+const myLogger = (req, res, next) => {
+  console.log('now ', req.url, req.query)
+  next()
+}
+
+
+
+
 
 export async function connectToMongoDB() {
   try {
@@ -33,6 +42,7 @@ await connectToMongoDB()
 const database = client.db("pizzahubdb")
 const user = database.collection("user")
 const menu = database.collection("menuData")
+const sessions = database.collection('session')
 const orders = database.collection('orders')
 const payments = database.collection('payments')
 // Read-only payment history shown to admins and vendors
@@ -55,9 +65,104 @@ for (const collection of [vendorProfile, customerProfile]) {
   }
 }
 
+
+
 // ---------- Helpers ----------
+
 const clean = (value) => (typeof value === "string" ? value.trim() : "")
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+
+// ---------- Authentication & authorization ----------
+
+
+const forbidden = (res, message = "You are not allowed to do this") =>
+  res.status(403).send({ success: false, message })
+
+// Reads the user id out of a JWT (when JWKS_URL is set in .env), or out of the
+// session token stored by Better Auth (default). Returns null when invalid.
+let jwks = null
+const userIdFromToken = async (token) => {
+  try {
+    if (process.env.JWKS_URL) {
+      // JWT mode: npm i jose, then set JWKS_URL=http://localhost:3000/api/auth/jwks
+      const { createRemoteJWKSet, jwtVerify } = await import("jose")
+      jwks ||= createRemoteJWKSet(new URL(process.env.JWKS_URL))
+      const { payload } = await jwtVerify(token, jwks)
+      return String(payload.id ?? payload.sub ?? "") || null
+    }
+
+    // Session-token mode
+    const session = await sessions.findOne({
+      token,
+      expiresAt: { $gt: new Date() },
+    })
+    return session ? String(session.userId) : null
+  } catch {
+    return null
+  }
+}
+
+const verifyToken = async (req, res, next) => {
+  
+  try {
+    const authHeader = req.headers.authorization
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res
+        .status(401)
+        .send({ success: false, message: "Unauthorized: token missing" })
+    }
+
+    const token = authHeader.split(" ")[1]
+    if (!token) {
+      return res.status(401).send({ success: false, message: "Token missing" })
+    }
+
+    const uid = await userIdFromToken(token)
+    if (!uid) {
+      return res
+        .status(401)
+        .send({ success: false, message: "Invalid or expired token" })
+    }
+
+    const account = await user.findOne(
+      ObjectId.isValid(uid)
+        ? { $or: [{ _id: new ObjectId(uid) }, { id: uid }] }
+        : { id: uid }
+    )
+    if (!account) {
+      return res.status(401).send({ success: false, message: "User not found" })
+    }
+
+    // The role and the blocked status are read from the database on every
+    // request, so an admin's block or a role change takes effect immediately.
+    if (account.status === "blocked") return blockedResponse(res)
+
+    req.user = account
+    next()
+  } catch (error) {
+    console.error("Authentication error:", error)
+    return res
+      .status(500)
+      .send({ success: false, message: "Authentication failed" })
+  }
+}
+
+
+
+
+const requireRole = (...roles) => (req, res, next) =>
+  roles.includes(req.user?.role) ? next() : forbidden(res)
+
+// Is the signed-in user the owner of something stored under `ownerEmail`?
+const isOwner = (req, ownerEmail) =>
+  clean(ownerEmail).toLowerCase() === clean(req.user?.email).toLowerCase()
+
+const isOwnerOrAdmin = (req, ownerEmail) =>
+  req.user?.role === "admin" || isOwner(req, ownerEmail)
+
+// The :email in a URL must be the signed-in user's own email
+const ownsEmail = (req, email) => isOwner(req, email)
 
 // Free vendors can publish this many active (available) menu items
 const FREE_ACTIVE_ITEM_LIMIT = 3
@@ -90,52 +195,38 @@ async function isPremiumBusiness(businessName) {
   return Boolean(owner?.account?.premium)
 }
 
-// ---------- Profile ----------
-// app.get("/profile/:email", async (req, res) => {
-//   try {
-//     const email = decodeURIComponent(req.params.email).trim().toLowerCase()
 
-//     // The user collection is the source of truth for who this is and their role
-//     const account = await user.findOne({ email })
+// ---------- Blocked accounts ----------
 
-//     if (!account) {
-//       return res.status(404).send({
-//         success: false,
-//         message: "Profile not found",
-//       })
-//     }
+const isBlockedEmail = async (email) => {
+  if (!email) return false
 
-//     const role = account.role || "customer"
-//     const profileDoc = await profileCollectionFor(role).findOne({ email })
+  const account = await user.findOne(
+    { email: clean(email).toLowerCase() },
+    { projection: { status: 1 } }
+  )
 
-//     // No saved profile yet: start from the basic account info
-//     const base = profileDoc || {
-//       name: account.name,
-//       image: account.image,
-//       createdAt: account.createdAt,
-//     }
+  return account?.status === "blocked"
+}
 
-//     res.status(200).send({
-//       ...base,
-//       name: base.name || "",
-//       email,
-//       role,
-//       phone: base.phone || "",
-//       address: base.address || "",
-//       bio: base.bio || "",
-//       image: base.image || "",
-//       businessName: base.businessName || "",
-//       businessLocation: base.businessLocation || "",
-//       openingHours: base.openingHours || "",
-//     })
-//   } catch (error) {
-//     console.error("Get profile error:", error)
-//     res.status(500).send({
-//       success: false,
-//       message: "Failed to load profile",
-//     })
-//   }
-// })
+const blockedResponse = (res) =>
+  res.status(403).send({
+    success: false,
+    code: "ACCOUNT_BLOCKED",
+    message: "Your account has been blocked by an administrator.",
+  })
+
+
+
+// Blocked accounts are refused inside verifyToken (every private route).
+
+
+const getBlockedVendorEmails = async () => {
+  const rows = await user
+    .find({ role: "vendor", status: "blocked" }, { projection: { email: 1 } })
+    .toArray()
+  return rows.map((r) => String(r.email).toLowerCase())
+}
 
 // ---------- PROFILE HELPERS ----------
 
@@ -153,7 +244,7 @@ const getProfileByRole = async (email, expectedRole) => {
 
   const allowed =
     expectedRole === "customer"
-      ? ["customer", "admin"].includes(actualRole)
+      ? actualRole === "customer"
       : actualRole === "vendor"
 
   if (!allowed) {
@@ -189,94 +280,6 @@ const getProfileByRole = async (email, expectedRole) => {
 }
 
 
-// ---------- PROFILE UPDATE HELPER ----------
-
-// const updateProfileByRole = async (email, expectedRole, body) => {
-//   const account = await user.findOne({ email })
-
-//   if (!account) {
-//     return {
-//       error: "Account not found",
-//       status: 404,
-//     }
-//   }
-
-//   const actualRole = account.role || "customer"
-
-//   const allowed =
-//     expectedRole === "customer"
-//       ? ["customer", "admin"].includes(actualRole)
-//       : actualRole === "vendor"
-
-//   if (!allowed) {
-//     return {
-//       error: "You are not authorized to update this profile",
-//       status: 403,
-//     }
-//   }
-
-//   const name = clean(body.name)
-
-//   if (name.length < 2) {
-//     return {
-//       error: "Name must contain at least 2 characters",
-//       status: 400,
-//     }
-//   }
-
-//   const updateDoc = {
-//     name,
-//     phone: clean(body.phone),
-//     address: clean(body.address),
-//     bio: clean(body.bio),
-//     image: clean(body.image),
-//     updatedAt: new Date(),
-//   }
-
-//   if (expectedRole === "vendor") {
-//     const businessName = clean(body.businessName)
-//     const businessLocation = clean(body.businessLocation)
-//     const openingHours = clean(body.openingHours)
-
-//     if (!businessName || !businessLocation || !openingHours) {
-//       return {
-//         error:
-//           "Business name, business location and opening hours are required",
-//         status: 400,
-//       }
-//     }
-
-//     updateDoc.businessName = businessName
-//     updateDoc.businessLocation = businessLocation
-//     updateDoc.openingHours = openingHours
-//   }
-
-//   const collection =
-//     expectedRole === "vendor" ? vendorProfile : customerProfile
-
-//   await collection.updateOne(
-//     { email },
-//     {
-//       $set: updateDoc,
-//       $setOnInsert: {
-//         email,
-//         role: actualRole,
-//         createdAt: account.createdAt || new Date(),
-//       },
-//     },
-//     { upsert: true }
-//   )
-
-//   const updatedProfile = await collection.findOne({ email })
-
-//   return {
-//     profile: {
-//       ...updatedProfile,
-//       role: actualRole,
-//     },
-//   }
-// }
-
 
 const updateProfileByRole = async (email, expectedRole, body) => {
   const account = await user.findOne({ email })
@@ -292,7 +295,7 @@ const updateProfileByRole = async (email, expectedRole, body) => {
 
   const allowed =
     expectedRole === "customer"
-      ? ["customer", "admin"].includes(actualRole)
+      ? actualRole === "customer"
       : actualRole === "vendor"
 
   if (!allowed) {
@@ -394,11 +397,13 @@ const updateProfileByRole = async (email, expectedRole, body) => {
 
 // GET /vendor-profile/:email
 
-app.get("/vendor-profile/:email", async (req, res) => {
+app.get("/vendor-profile/:email", verifyToken, requireRole("vendor"), async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email)
       .trim()
       .toLowerCase()
+
+    if (!ownsEmail(req, email)) return forbidden(res)
 
     const result = await getProfileByRole(email, "vendor")
 
@@ -423,11 +428,15 @@ app.get("/vendor-profile/:email", async (req, res) => {
 
 // PUT /vendor-profile/:email
 
-app.put("/vendor-profile/:email", async (req, res) => {
+
+app.put("/vendor-profile/:email", verifyToken, requireRole("vendor"), async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email)
       .trim()
       .toLowerCase()
+
+    // A vendor can only change their own profile
+    if (!ownsEmail(req, email)) return forbidden(res)
 
     const result = await updateProfileByRole(
       email,
@@ -442,7 +451,7 @@ app.put("/vendor-profile/:email", async (req, res) => {
       })
     }
 
-    res.status(200).send({
+    return res.status(200).send({
       success: true,
       message: "Vendor profile updated successfully",
       ...result.profile,
@@ -450,7 +459,7 @@ app.put("/vendor-profile/:email", async (req, res) => {
   } catch (error) {
     console.error("Update vendor profile error:", error)
 
-    res.status(500).send({
+    return res.status(500).send({
       success: false,
       message: "Failed to update vendor profile",
     })
@@ -464,11 +473,13 @@ app.put("/vendor-profile/:email", async (req, res) => {
 
 // GET /customer-profile/:email
 
-app.get("/customer-profile/:email", async (req, res) => {
+app.get("/customer-profile/:email", verifyToken, requireRole("customer"), async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email)
       .trim()
       .toLowerCase()
+
+    if (!ownsEmail(req, email)) return forbidden(res)
 
     const result = await getProfileByRole(email, "customer")
 
@@ -493,11 +504,13 @@ app.get("/customer-profile/:email", async (req, res) => {
 
 // PUT /customer-profile/:email
 
-app.put("/customer-profile/:email", async (req, res) => {
+app.put("/customer-profile/:email", verifyToken, requireRole("customer"), async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email)
       .trim()
       .toLowerCase()
+
+    if (!ownsEmail(req, email)) return forbidden(res)
 
     const result = await updateProfileByRole(
       email,
@@ -528,11 +541,13 @@ app.put("/customer-profile/:email", async (req, res) => {
 })
 
 // ---------- Subscription ----------
-// Reads the premium flag that /payments/checkout-verify writes after a
+
 // successful Stripe payment. Only a boolean is returned.
-app.get("/subscription/:email", async (req, res) => {
+app.get("/subscription/:email", verifyToken, requireRole("vendor"), async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email).trim().toLowerCase()
+
+    if (!ownsEmail(req, email)) return forbidden(res)
 
     const account = await user.findOne(
       { email },
@@ -540,6 +555,7 @@ app.get("/subscription/:email", async (req, res) => {
     )
 
     if (!account) {
+
       return res.status(404).send({
         success: false,
         message: "Account not found",
@@ -561,9 +577,11 @@ app.get("/subscription/:email", async (req, res) => {
   }
 })
 
-app.put("/profile/:email", async (req, res) => {
+app.put("/profile/:email", verifyToken, requireRole("vendor", "customer"), async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email).trim().toLowerCase()
+
+    if (!ownsEmail(req, email)) return forbidden(res)
 
     const {
       name,
@@ -593,6 +611,12 @@ app.put("/profile/:email", async (req, res) => {
     }
 
     const role = account.role || "customer"
+    if (role === "admin") {
+      return res.status(403).send({
+        success: false,
+        message: "Admins do not have a profile",
+      })
+    }
     const isVendor = role === "vendor"
 
     // if (isVendor) {
@@ -609,11 +633,11 @@ app.put("/profile/:email", async (req, res) => {
     //   }
     // }
     if (isVendor && !clean(businessName)) {
-  return res.status(400).send({
-    success: false,
-    message: "Business name is required for vendors",
-  })
-}
+      return res.status(400).send({
+        success: false,
+        message: "Business name is required for vendors",
+      })
+    }
     const updateDoc = {
       name: name.trim(),
       phone: phone?.trim() || "",
@@ -661,24 +685,23 @@ app.put("/profile/:email", async (req, res) => {
   }
 })
 
-// ---------- GET /menu ----------
-// Public menu list with optional filters:
-//   /menu?name=pepperoni&category=Pizza&location=Dhanmondi&businessName=Pizza%20Hub
-app.get("/menu", async (req, res) => {
+
+app.get("/menu", verifyToken, requireRole("vendor", "admin"), async (req, res) => {
   try {
-    // Public visitors only see approved dishes. Vendor dashboards need their
-    // pending/rejected items too, so approval is filtered only when asked:
-    //   /menu?approvalStatus=approved | pending | rejected
-    //   /menu?approvalStatus=all -> every status
     const query = {}
 
+    // Vendors only ever see their own dishes; admins see everything
+    if (req.user.role === "vendor") {
+      const own = clean(req.user.email).toLowerCase()
+      query.$or = [{ vendorEmail: own }, { email: own }]
+    }
+
     const approvalStatus = clean(req.query.approvalStatus)
-    if (approvalStatus === "all") {
-      // no approval filter
-    } else if (approvalStatus) {
+
+    // Default: show only approved items
+    if (approvalStatus && approvalStatus !== "all") {
       query.approvalStatus = approvalStatus
-    } else {
-      // Default: only approved dishes are ever returned
+    } else if (approvalStatus !== "all") {
       query.approvalStatus = "approved"
     }
 
@@ -687,27 +710,26 @@ app.get("/menu", async (req, res) => {
     const location = clean(req.query.location)
     const businessName = clean(req.query.businessName)
 
-    // Every word typed must appear in the dish name, in any order
-    // "smoky supreme" matches "Smoky Pepperoni Supreme"
     if (name) {
-      query.$and = name
-        .split(/\s+/)
-        .map((word) => ({
-          name: { $regex: escapeRegex(word), $options: "i" },
-        }))
+      query.$and = name.split(/\s+/).map((word) => ({
+        name: { $regex: escapeRegex(word), $options: "i" },
+      }))
     }
 
-    // Exact category, case-insensitive
     if (category) {
-      query.category = { $regex: `^${escapeRegex(category)}$`, $options: "i" }
+      query.category = {
+        $regex: `^${escapeRegex(category)}$`,
+        $options: "i",
+      }
     }
 
-    // Partial location match, case-insensitive
     if (location) {
-      query.location = { $regex: escapeRegex(location), $options: "i" }
+      query.location = {
+        $regex: escapeRegex(location),
+        $options: "i",
+      }
     }
 
-    // Exact business match, case-insensitive
     if (businessName) {
       query.businessName = {
         $regex: `^${escapeRegex(businessName)}$`,
@@ -716,6 +738,7 @@ app.get("/menu", async (req, res) => {
     }
 
     const result = await menu.find(query).limit(200).toArray()
+
     res.status(200).send(result)
   } catch (error) {
     console.error("Failed to fetch menu:", error)
@@ -727,7 +750,7 @@ app.get("/menu", async (req, res) => {
 })
 
 
-app.post("/menu", async (req, res) => {
+app.post("/menu", verifyToken, requireRole("vendor"), async (req, res) => {
   try {
     const {
       email,
@@ -741,7 +764,8 @@ app.post("/menu", async (req, res) => {
     } = req.body || {}
 
     // 1. Validate vendor email
-    const vendorEmail = clean(email).toLowerCase()
+    // The vendor is the signed-in account - never the email sent by the browser
+    const vendorEmail = clean(req.user.email).toLowerCase()
 
     if (!vendorEmail) {
       return res.status(400).send({
@@ -782,7 +806,7 @@ app.post("/menu", async (req, res) => {
     if (
       !submittedBusinessName ||
       submittedBusinessName.toLowerCase() !==
-        profileBusinessName.toLowerCase()
+      profileBusinessName.toLowerCase()
     ) {
       return res.status(409).send({
         success: false,
@@ -849,6 +873,7 @@ app.post("/menu", async (req, res) => {
       price: itemPrice,
       businessName: profileBusinessName,
       vendorEmail,
+      email: vendorEmail,
       location: itemLocation,
       image: itemImage,
       approvalStatus: "pending",
@@ -875,13 +900,267 @@ app.post("/menu", async (req, res) => {
 })
 
 
+
+app.patch("/menu/:id/moderation", verifyToken, requireRole("admin"), async (req, res) => {
+  try {
+    const { id } = req.params
+    const approvalStatus = clean(req.body?.approvalStatus)
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid menu item ID",
+      })
+    }
+
+    // Accept approved and pending statuses
+    if (!["approved", "pending"].includes(approvalStatus)) {
+      return res.status(400).send({
+        success: false,
+        message: "Status must be approved or pending",
+      })
+    }
+
+    const item = await menu.findOne({
+      _id: new ObjectId(id),
+    })
+
+    if (!item) {
+      return res.status(404).send({
+        success: false,
+        message: "Menu item not found",
+      })
+    }
+
+    let isAvailable = false
+
+    // Only approved items can be available
+    if (approvalStatus === "approved") {
+      const premium = await isPremiumBusiness(item.businessName)
+
+      if (premium) {
+        isAvailable = true
+      } else {
+        const activeItems = await menu.countDocuments({
+          businessName: {
+            $regex: `^${escapeRegex(clean(item.businessName))}$`,
+            $options: "i",
+          },
+          approvalStatus: "approved",
+          isAvailable: true,
+          _id: { $ne: item._id },
+        })
+
+        isAvailable = activeItems < FREE_ACTIVE_ITEM_LIMIT
+      }
+    }
+
+    // Update MongoDB
+    await menu.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          approvalStatus,
+          isAvailable,
+          reviewedAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    )
+
+    // Get updated document
+    const updatedItem = await menu.findOne({
+      _id: new ObjectId(id),
+    })
+
+    return res.status(200).send({
+      success: true,
+      message: `Menu item ${approvalStatus} successfully`,
+      approvalStatus: updatedItem.approvalStatus,
+      isAvailable: updatedItem.isAvailable,
+      menu: updatedItem,
+    })
+
+  } catch (error) {
+    console.error("Moderation error:", error)
+
+    return res.status(500).send({
+      success: false,
+      message: "Failed to update approval status",
+    })
+  }
+})
+
+
+
+
+app.put("/menu/:id", verifyToken, requireRole("vendor", "admin"), async (req, res) => {
+  try {
+    const { id } = req.params
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid item id" })
+    }
+
+    // Only the owner (or an admin) may edit a dish
+    const existing = await menu.findOne({ _id: new ObjectId(id) })
+    if (!existing) {
+      return res.status(404).send({ message: "Menu item not found" })
+    }
+    if (!isOwnerOrAdmin(req, existing.vendorEmail || existing.email)) {
+      return forbidden(res, "This is not your dish")
+    }
+
+    const { name, price, location, description } = req.body || {}
+
+    if (
+      !name || name.trim().length < 3 ||
+      !location?.trim() ||
+      !description?.trim() ||
+      !Number.isFinite(Number(price)) || Number(price) <= 0
+    ) {
+      return res.status(400).send({ message: "Invalid data" })
+    }
+
+    // Only whitelisted fields can be changed
+    const result = await menu.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          name: name.trim(),
+          price: Number(price),
+          location: location.trim(),
+          description: description.trim(),
+          updatedAt: new Date(),
+        },
+      }
+    )
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: "Menu item not found" })
+    }
+
+    res.send({ message: "Menu item updated", modifiedCount: result.modifiedCount })
+  } catch (error) {
+    console.error(error)
+    res.status(500).send({ message: "Server error" })
+  }
+})
+
+app.delete("/menu/:id", verifyToken, requireRole("vendor", "admin"), async (req, res) => {
+  try {
+    const { id } = req.params
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid item id" })
+    }
+
+    // Only the owner (or an admin) may delete a dish
+    const existing = await menu.findOne({ _id: new ObjectId(id) })
+    if (!existing) {
+      return res.status(404).send({ message: "Menu item not found" })
+    }
+    if (!isOwnerOrAdmin(req, existing.vendorEmail || existing.email)) {
+      return forbidden(res, "This is not your dish")
+    }
+
+    const result = await menu.deleteOne({ _id: new ObjectId(id) })
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ message: "Menu item not found" })
+    }
+
+    res.send({ message: "Menu item deleted", deletedCount: result.deletedCount })
+  } catch (error) {
+    console.error(error)
+    res.status(500).send({ message: "Server error" })
+  }
+})
+
+app.patch("/menu/:id/availability", verifyToken, requireRole("vendor", "admin"), async (req, res) => {
+  try {
+    const { id } = req.params
+    const { isAvailable } = req.body || {}
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid item id" })
+    }
+    if (typeof isAvailable !== "boolean") {
+      return res.status(400).send({ message: "isAvailable must be true or false" })
+    }
+
+    const item = await menu.findOne({ _id: new ObjectId(id) })
+
+    if (!item) {
+      return res.status(404).send({ message: "Menu item not found" })
+    }
+
+    // Only the owner (or an admin) may change a dish
+    if (!isOwnerOrAdmin(req, item.vendorEmail || item.email)) {
+      return forbidden(res, "This is not your dish")
+    }
+
+    // Publishing rules only matter when an item is being turned on
+    if (isAvailable) {
+      // Only approved dishes can be published
+      if (item.approvalStatus !== "approved") {
+        return res.status(400).send({
+          success: false,
+          message: "This item must be approved before it can be published.",
+        })
+      }
+
+      // Free vendors can publish at most FREE_ACTIVE_ITEM_LIMIT active items.
+      // Premium vendors have no limit. Admins may publish on a vendor's behalf.
+      const premium = await isPremiumBusiness(item.businessName)
+
+      const adminBypass = req.user.role === "admin"
+
+      if (!premium && !adminBypass) {
+        const activeItems = await menu.countDocuments({
+          businessName: {
+            $regex: `^${escapeRegex(clean(item.businessName))}$`,
+            $options: "i",
+          },
+          approvalStatus: "approved",
+          isAvailable: true,
+          _id: { $ne: item._id },
+        })
+
+        if (activeItems >= FREE_ACTIVE_ITEM_LIMIT) {
+          return res.status(403).send({
+            success: false,
+            code: "PREMIUM_REQUIRED",
+            message: `Free vendors can publish up to ${FREE_ACTIVE_ITEM_LIMIT} active items. Upgrade to Premium to publish more.`,
+            activeItems,
+            limit: FREE_ACTIVE_ITEM_LIMIT,
+          })
+        }
+      }
+    }
+
+    const result = await menu.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { isAvailable, updatedAt: new Date() } }
+    )
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: "Menu item not found" })
+    }
+
+    res.send({ message: "Availability updated", isAvailable })
+  } catch (error) {
+    console.error(error)
+    res.status(500).send({ message: "Server error" })
+  }
+})
+
+
 // ---------- Orders ----------
 
 // My orders page: /orders?email=x@y.com
-app.get('/orders', async (req, res) => {
+app.get('/orders', verifyToken, requireRole('customer'), async (req, res) => {
   try {
-    const email = clean(req.query.email).toLowerCase()
-    if (!email) return res.status(400).send({ success: false, message: 'email is required' })
+    // My orders: always the signed-in customer's own orders
+    const email = clean(req.user.email).toLowerCase()
 
     const result = await orders.find({ 'customer.email': email }).sort({ createdAt: -1 }).limit(200).toArray()
     res.send(result)
@@ -891,12 +1170,11 @@ app.get('/orders', async (req, res) => {
   }
 })
 
-// ---------- PATCH /orders/:id/cancel ----------
-// A customer can cancel only their OWN order, and only while it is pending.
-app.patch('/orders/:id/cancel', async (req, res) => {
+// ---------- PATCH /orders/
+app.patch('/orders/:id/cancel', verifyToken, requireRole('customer'), async (req, res) => {
   try {
     const { id } = req.params
-    const email = clean(req.body?.email).toLowerCase()
+    const email = clean(req.user.email).toLowerCase()
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({ success: false, message: 'Invalid order id' })
@@ -940,12 +1218,8 @@ app.patch('/orders/:id/cancel', async (req, res) => {
 })
 
 // ---------- Payments ----------
-// Verifies a Stripe Checkout session after a successful payment:
-//   1. the session is complete and paid
-//   2. the transaction has not been saved before (a page refresh must not insert twice)
-//   3. the transaction is stored in the read-only `transactions` collection
-//   4. the subscription is upgraded only after that verified confirmation
-app.post('/payments/checkout-verify', async (req, res) => {
+
+app.post('/payments/checkout-verify', verifyToken, requireRole('vendor'), async (req, res) => {
   try {
     const sessionId = clean(req.body?.sessionId)
 
@@ -981,6 +1255,11 @@ app.post('/payments/checkout-verify', async (req, res) => {
         success: false,
         message: 'No user on this payment',
       })
+    }
+
+    // The payment must belong to the signed-in vendor
+    if (userId !== String(req.user._id) && userId !== String(req.user.id || '')) {
+      return forbidden(res, 'This payment does not belong to your account')
     }
 
     // A page refresh must not save the same transaction twice
@@ -1028,7 +1307,6 @@ app.post('/payments/checkout-verify', async (req, res) => {
     }
 
     const result = await transactions.insertOne(transaction)
-
     // Upgrade the account only after Stripe confirmed the payment
     if (account) {
       await user.updateOne(accountQuery, {
@@ -1045,7 +1323,7 @@ app.post('/payments/checkout-verify', async (req, res) => {
     console.error('Checkout verify failed:', error)
     res.status(500).send({
       success: false,
-      message: 'Payment verification failed',
+      message: error?.message || 'payment verification failed'
     })
   }
 })
@@ -1053,22 +1331,55 @@ app.post('/payments/checkout-verify', async (req, res) => {
 // ---------- POST /orders ----------
 // Saves ONE order per kitchen, so every order belongs to exactly one vendor
 // and a vendor can never touch another vendor's food.
-app.post('/orders', async (req, res) => {
+app.post('/orders', verifyToken, requireRole('customer'), async (req, res) => {
   try {
+    // console.log('headers on the server',req.headers)
     const { customer, items, delivery, paymentMethod } = req.body || {}
 
-    const email = clean(customer?.email).toLowerCase()
-    if (!email) {
-      return res.status(400).send({ success: false, message: 'Customer email is required' })
-    }
+    // The customer is the signed-in account - never the email sent by the browser
+    const email = clean(req.user.email).toLowerCase()
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).send({ success: false, message: 'Order has no items' })
     }
 
-    // Prices and kitchen names come from the database, not from the browser
+    // Delivery details are required by the order form
+    const deliveryDate = clean(delivery?.date)
+    const deliveryAddress = clean(delivery?.address)
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(deliveryDate)) {
+      return res.status(400).send({
+        success: false,
+        message: 'Please choose a valid delivery date.',
+      })
+    }
+
+    const today = new Date()
+    const pad = (value) => String(value).padStart(2, '0')
+    const todayString = `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`
+
+    if (deliveryDate < todayString) {
+      return res.status(400).send({
+        success: false,
+        message: 'The delivery date cannot be in the past.',
+      })
+    }
+
+    if (deliveryAddress.length < 5) {
+      return res.status(400).send({
+        success: false,
+        message: 'Please add a complete delivery address.',
+      })
+    }
+
+    // Prices, images and kitchen names come from the database, not the browser.
+    // Only dishes that are approved AND published can be ordered.
     const ids = items.map((i) => clean(i.menuId)).filter((id) => ObjectId.isValid(id))
     const dishes = await menu
-      .find({ _id: { $in: ids.map((id) => new ObjectId(id)) }, approvalStatus: 'approved' })
+      .find({
+        _id: { $in: ids.map((id) => new ObjectId(id)) },
+        approvalStatus: 'approved',
+        isAvailable: true,
+      })
       .toArray()
     const byId = new Map(dishes.map((d) => [String(d._id), d]))
 
@@ -1088,6 +1399,34 @@ app.post('/orders', async (req, res) => {
         quantity,
         businessName: dish.businessName,
         lineTotal: Number(dish.price) * quantity,
+      })
+    }
+
+    
+    const customerAccount = await user.findOne({ email })
+    if (!customerAccount || customerAccount.role !== 'customer') {
+      return res.status(403).send({
+        success: false,
+        message: 'Only customers can place orders',
+      })
+    }
+
+    // The same item cannot have two active orders for the same delivery date
+    const activeStatuses = ['pending', 'accepted']
+    const menuIds = [...new Set(orderItems.map((item) => item.menuId))]
+
+    const duplicate = await orders.findOne({
+      'customer.email': email,
+      status: { $in: activeStatuses },
+      'delivery.date': deliveryDate,
+      'items.menuId': { $in: menuIds },
+    })
+
+    if (duplicate) {
+      return res.status(409).send({
+        success: false,
+        code: 'DUPLICATE_ORDER',
+        message: `You already have an active order for this item on ${deliveryDate}.`,
       })
     }
 
@@ -1120,15 +1459,15 @@ app.post('/orders', async (req, res) => {
         vendorKey,
         businessName: vendorItems[0].businessName,
         customer: {
-          id: clean(customer?.id),
+          id: String(req.user._id),
           name: clean(customer?.name) || customerDoc?.name || '',
           email,
           phone: clean(customer?.phone) || customerDoc?.phone || '',
         },
         items: vendorItems,
         delivery: {
-          address: clean(delivery?.address),
-          date: clean(delivery?.date),
+          address: deliveryAddress,
+          date: deliveryDate,
           note: clean(delivery?.note),
         },
         paymentMethod: clean(paymentMethod) || 'cod',
@@ -1171,10 +1510,9 @@ async function getVendorBusiness(email) {
 }
 
 // Vendor's customer orders: /vendor/orders?email=vendor@x.com
-app.get('/vendor/orders', async (req, res) => {
+app.get('/vendor/orders', verifyToken, requireRole('vendor'), async (req, res) => {
   try {
-    const email = clean(req.query.email).toLowerCase()
-    if (!email) return res.status(400).send({ success: false, message: 'email is required' })
+    const email = clean(req.user.email).toLowerCase()
 
     const vendor = await getVendorBusiness(email)
     if (vendor.error) return res.status(vendor.status).send({ success: false, message: vendor.error })
@@ -1193,10 +1531,10 @@ app.get('/vendor/orders', async (req, res) => {
 })
 
 // Accept or reject: PATCH /orders/:id/status  { email, status: "accepted" | "rejected" }
-app.patch('/orders/:id/status', async (req, res) => {
+app.patch('/orders/:id/status', verifyToken, requireRole('vendor'), async (req, res) => {
   try {
     const { id } = req.params
-    const email = clean(req.body?.email).toLowerCase()
+    const email = clean(req.user.email).toLowerCase()
     const status = clean(req.body?.status)
 
     if (!ObjectId.isValid(id)) {
@@ -1242,22 +1580,24 @@ app.patch('/orders/:id/status', async (req, res) => {
 })
 
 // ---------- GET /transactions ----------
-// Payment history. Read-only by design: there is deliberately no POST, PUT,
-// PATCH or DELETE route for transactions, so records cannot be edited.
-//   /transactions                        -> every transaction (admin view)
-//   /transactions?vendorEmail=x@y.com    -> one vendor's history
-app.get('/transactions', async (req, res) => {
+
+app.get('/transactions', verifyToken, requireRole('admin', 'vendor'), async (req, res) => {
   try {
     const query = {}
 
-    const vendorEmail = clean(req.query.vendorEmail)
     const userId = clean(req.query.userId)
     const paymentStatus = clean(req.query.paymentStatus)
 
-    if (vendorEmail) {
-      query.vendorEmail = {
-        $regex: `^${escapeRegex(vendorEmail)}$`,
-        $options: 'i',
+    if (req.user.role === 'vendor') {
+      // A vendor only ever sees their own payments
+      query.vendorEmail = clean(req.user.email).toLowerCase()
+    } else {
+      const vendorEmail = clean(req.query.vendorEmail)
+      if (vendorEmail) {
+        query.vendorEmail = {
+          $regex: `^${escapeRegex(vendorEmail)}$`,
+          $options: 'i',
+        }
       }
     }
 
@@ -1285,15 +1625,56 @@ app.get('/transactions', async (req, res) => {
   }
 })
 
+// ---------- GET /admin/stats ----------
+// Dashboard numbers for the admin overview. The admin email is checked
+// against the user collection so ordinary accounts cannot read these counts.
+//   /admin/stats?email=admin@example.com
+app.get('/admin/stats', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+
+    const [
+      totalUsers,
+      totalVendors,
+      totalCustomers,
+      totalMenuItems,
+      pendingMenuItems,
+      totalTransactions,
+    ] = await Promise.all([
+      user.countDocuments({}),
+      user.countDocuments({ role: 'vendor' }),
+      user.countDocuments({ role: 'customer' }),
+      menu.countDocuments({}),
+      menu.countDocuments({ approvalStatus: 'pending' }),
+      transactions.countDocuments({}),
+    ])
+
+    res.status(200).send({
+      totalUsers,
+      totalVendors,
+      totalCustomers,
+      totalMenuItems,
+      pendingMenuItems,
+      totalTransactions,
+    })
+  } catch (error) {
+    console.error('Failed to load admin stats:', error)
+    res.status(500).send({
+      success: false,
+      message: 'Failed to load admin statistics',
+    })
+  }
+})
+
 // ---------- GET /browse-menu ----------
-// Public menu list with optional filters:
-//   /browse-menu?name=Smoky%20pepperoni%20Supreme
-//   /browse-menu?name=pepperoni&category=Pizza&location=Dhanmondi
+
 app.get("/browse-menu", async (req, res) => {
   try {
     // Public endpoint: only approved dishes are ever returned
-    const query = { approvalStatus: "approved" }
-
+    // const query = { approvalStatus: "approved" }
+    const query = {
+      approvalStatus: "approved",
+      isAvailable: true,
+    }
     const name = clean(req.query.name)
     const category = clean(req.query.category)
     const location = clean(req.query.location)
@@ -1326,11 +1707,14 @@ app.get("/browse-menu", async (req, res) => {
         $options: "i",
       }
     }
+    // Dishes of blocked vendors are never public
+    const blockedVendors = await getBlockedVendorEmails()
+    if (blockedVendors.length) query.vendorEmail = { $nin: blockedVendors }
+
     const search = clean(req.query.search)
 
     if (search) {
       const regex = { $regex: escapeRegex(search), $options: "i" }
-
       query.$or = [
         { name: regex },
         { category: regex },
@@ -1359,12 +1743,23 @@ app.get("/browse-menu/:id", async (req, res) => {
       return res.status(400).send({ success: false, message: "Invalid item id" })
     }
 
+    // const item = await menu.findOne({
+    //   _id: new ObjectId(id),
+    //   approvalStatus: "approved",
+    // })
     const item = await menu.findOne({
       _id: new ObjectId(id),
       approvalStatus: "approved",
+      isAvailable: true,
     })
 
     if (!item) {
+      return res.status(404).send({ success: false, message: "Item not found" })
+    }
+
+    // A blocked vendor's dishes are not public
+    const blockedVendors = await getBlockedVendorEmails()
+    if (blockedVendors.includes(String(item.vendorEmail || "").toLowerCase())) {
       return res.status(404).send({ success: false, message: "Item not found" })
     }
 
@@ -1378,148 +1773,16 @@ app.get("/browse-menu/:id", async (req, res) => {
   }
 })
 
-app.put("/menu/:id", async (req, res) => {
-  try {
-    const { id } = req.params
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "Invalid item id" })
-    }
 
-    const { name, price, location, description } = req.body
-
-    if (
-      !name || name.trim().length < 3 ||
-      !location?.trim() ||
-      !description?.trim() ||
-      !Number.isFinite(Number(price)) || Number(price) <= 0
-    ) {
-      return res.status(400).send({ message: "Invalid data" })
-    }
-
-    // Only whitelisted fields can be changed
-    const result = await menu.updateOne(
-      { _id: new ObjectId(id) },
-      {
-        $set: {
-          name: name.trim(),
-          price: Number(price),
-          location: location.trim(),
-          description: description.trim(),
-          updatedAt: new Date(),
-        },
-      }
-    )
-
-    if (result.matchedCount === 0) {
-      return res.status(404).send({ message: "Menu item not found" })
-    }
-
-    res.send({ message: "Menu item updated", modifiedCount: result.modifiedCount })
-  } catch (error) {
-    console.error(error)
-    res.status(500).send({ message: "Server error" })
-  }
-})
-
-app.delete("/menu/:id", async (req, res) => {
-  try {
-    const { id } = req.params
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "Invalid item id" })
-    }
-
-    const result = await menu.deleteOne({ _id: new ObjectId(id) })
-
-    if (result.deletedCount === 0) {
-      return res.status(404).send({ message: "Menu item not found" })
-    }
-
-    res.send({ message: "Menu item deleted", deletedCount: result.deletedCount })
-  } catch (error) {
-    console.error(error)
-    res.status(500).send({ message: "Server error" })
-  }
-})
-
-app.patch("/menu/:id/availability", async (req, res) => {
-  try {
-    const { id } = req.params
-    const { isAvailable } = req.body
-
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "Invalid item id" })
-    }
-    if (typeof isAvailable !== "boolean") {
-      return res.status(400).send({ message: "isAvailable must be true or false" })
-    }
-
-    const item = await menu.findOne({ _id: new ObjectId(id) })
-
-    if (!item) {
-      return res.status(404).send({ message: "Menu item not found" })
-    }
-
-    // Publishing rules only matter when an item is being turned on
-    if (isAvailable) {
-      // Only approved dishes can be published
-      if (item.approvalStatus !== "approved") {
-        return res.status(400).send({
-          success: false,
-          message: "This item must be approved before it can be published.",
-        })
-      }
-
-      // Free vendors can publish at most FREE_ACTIVE_ITEM_LIMIT active items.
-      // Premium vendors have no limit.
-      const premium = await isPremiumBusiness(item.businessName)
-
-      if (!premium) {
-        const activeItems = await menu.countDocuments({
-          businessName: {
-            $regex: `^${escapeRegex(clean(item.businessName))}$`,
-            $options: "i",
-          },
-          isAvailable: true,
-          _id: { $ne: item._id },
-        })
-
-        if (activeItems >= FREE_ACTIVE_ITEM_LIMIT) {
-          return res.status(403).send({
-            success: false,
-            code: "PREMIUM_REQUIRED",
-            message: `Free vendors can publish up to ${FREE_ACTIVE_ITEM_LIMIT} active items. Upgrade to Premium to publish more.`,
-            activeItems,
-            limit: FREE_ACTIVE_ITEM_LIMIT,
-          })
-        }
-      }
-    }
-
-    const result = await menu.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { isAvailable, updatedAt: new Date() } }
-    )
-
-    if (result.matchedCount === 0) {
-      return res.status(404).send({ message: "Menu item not found" })
-    }
-
-    res.send({ message: "Availability updated", isAvailable })
-  } catch (error) {
-    console.error(error)
-    res.status(500).send({ message: "Server error" })
-  }
-})
 
 // ---------- Misc ----------
 app.get("/", (req, res) => {
   res.send("pizzahub is running")
 })
 
-app.get("/user", async (req, res) => {
-  const result = await user.find({}).toArray()
-  res.send(result)
-})
+
+
+
 
 // ---------- Error handler (must come after all routes) ----------
 app.use((error, req, res, next) => {
@@ -1540,6 +1803,7 @@ app.use((error, req, res, next) => {
     message: "Server error",
   })
 })
+
 
 // ---------- Start (must be last) ----------
 app.listen(port, () => {
