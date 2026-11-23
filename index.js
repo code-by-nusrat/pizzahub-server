@@ -1164,14 +1164,7 @@ app.delete("/menu/:id", verifyToken, requireRole("vendor", "admin"), async (req,
 })
 
 
-const activeItems = await menu.countDocuments({
-  vendorEmail,
-  approvalStatus: "approved",
-  isAvailable: true,
-  _id: {
-    $ne: item._id,
-  },
-})
+
 
 
 
