@@ -916,6 +916,169 @@ app.post("/menu", verifyToken, requireRole("vendor"), async (req, res) => {
 
 
 
+// app.patch(
+//   "/menu/:id/moderation",
+//   verifyToken,
+//   requireRole("admin"),
+//   async (req, res) => {
+//     try {
+//       const { id } = req.params
+//       const approvalStatus = clean(req.body?.approvalStatus)
+
+//       // Validate item ID
+//       if (!ObjectId.isValid(id)) {
+//         return res.status(400).send({
+//           success: false,
+//           message: "Invalid menu item ID",
+//         })
+//       }
+
+//       // Only these two moderation actions are allowed
+//       if (!["approved", "pending"].includes(approvalStatus)) {
+//         return res.status(400).send({
+//           success: false,
+//           message: "Status must be approved or pending",
+//         })
+//       }
+
+//       // Find the menu item
+//       const item = await menu.findOne({
+//         _id: new ObjectId(id),
+//       })
+
+//       if (!item) {
+//         return res.status(404).send({
+//           success: false,
+//           message: "Menu item not found",
+//         })
+//       }
+
+//       let isAvailable = false
+//       let activeItems = 0
+//       let limit = FREE_ACTIVE_ITEM_LIMIT
+//       let message = ""
+
+//       if (approvalStatus === "approved") {
+//         const vendorEmail = clean(
+//           item.vendorEmail || item.email
+//         ).toLowerCase()
+
+//         if (!vendorEmail) {
+//           return res.status(400).send({
+//             success: false,
+//             message: "Vendor email is missing",
+//           })
+//         }
+
+//         // Find the vendor account
+//         const vendorAccount = await user.findOne({
+//           email: vendorEmail,
+//           role: "vendor",
+//         })
+
+//         if (!vendorAccount) {
+//           return res.status(404).send({
+//             success: false,
+//             message: "Vendor account not found",
+//           })
+//         }
+
+//         // Do not approve items belonging to blocked vendors
+//         if (vendorAccount.status === "blocked") {
+//           return res.status(403).send({
+//             success: false,
+//             code: "ACCOUNT_BLOCKED",
+//             message: "This vendor account is blocked",
+//           })
+//         }
+
+//         const isPremium = Boolean(vendorAccount.premium)
+
+//         if (isPremium) {
+//           // Premium vendors have no active-item limit
+//           isAvailable = true
+//           limit = null
+//           message = "Menu item approved and activated successfully!"
+//         } else {
+//           // Count the vendor's OTHER active and approved items
+//           activeItems = await menu.countDocuments({
+//             $and: [
+//               {
+//                 $or: [
+//                   { vendorEmail },
+//                   { email: vendorEmail },
+//                 ],
+//               },
+//               {
+//                 approvalStatus: "approved",
+//                 isAvailable: true,
+//               },
+//               {
+//                 _id: { $ne: item._id },
+//               },
+//             ],
+//           })
+
+//           // Admin approval is always allowed.
+//           // The limit only controls whether the item becomes active.
+//           if (activeItems < FREE_ACTIVE_ITEM_LIMIT) {
+//             isAvailable = true
+//             message = "Menu item approved and activated successfully!"
+//           } else {
+//             isAvailable = false
+
+//             message =
+//               `Menu item approved successfully, but this vendor already has ` +
+//               `${activeItems} active items. The item remains unavailable. ` +
+//               `Free vendors can publish only ${FREE_ACTIVE_ITEM_LIMIT} active items.`
+//           }
+//         }
+//       } else {
+//         // Hiding an item makes it unavailable
+//         isAvailable = false
+//         message = "Menu item hidden from customers."
+//       }
+
+//       // Save the moderation result
+//       await menu.updateOne(
+//         { _id: item._id },
+//         {
+//           $set: {
+//             approvalStatus,
+//             isAvailable,
+//             reviewedAt: new Date(),
+//             updatedAt: new Date(),
+//           },
+//         }
+//       )
+
+//       // Get the updated item
+//       const updatedItem = await menu.findOne({
+//         _id: item._id,
+//       })
+
+//       return res.status(200).send({
+//         success: true,
+//         message,
+//         approvalStatus: updatedItem.approvalStatus,
+//         isAvailable: updatedItem.isAvailable,
+//         activeItems,
+//         limit,
+//         menu: updatedItem,
+//       })
+//     } catch (error) {
+//       console.error("Moderation error:", error)
+
+//       return res.status(500).send({
+//         success: false,
+//         message: "Failed to update approval status",
+//       })
+//     }
+//   }
+// )
+
+
+
 app.patch(
   "/menu/:id/moderation",
   verifyToken,
@@ -957,6 +1120,8 @@ app.patch(
       let activeItems = 0
       let limit = FREE_ACTIVE_ITEM_LIMIT
       let message = ""
+      // true = approved, but waiting for the vendor to subscribe to Premium
+      let blockedByLimit = false
 
       if (approvalStatus === "approved") {
         const vendorEmail = clean(
@@ -1025,12 +1190,13 @@ app.patch(
             isAvailable = true
             message = "Menu item approved and activated successfully!"
           } else {
+            // 4th item or more on a free plan: stays inactive until the
+            // vendor subscribes (checkout-verify activates flagged items)
             isAvailable = false
-
+            blockedByLimit = true
             message =
-              `Menu item approved successfully, but this vendor already has ` +
-              `${activeItems} active items. The item remains unavailable. ` +
-              `Free vendors can publish only ${FREE_ACTIVE_ITEM_LIMIT} active items.`
+              "Sorry, this vendor needs a Premium subscription to activate more than " +
+              `${FREE_ACTIVE_ITEM_LIMIT} items.`
           }
         }
       } else {
@@ -1046,6 +1212,7 @@ app.patch(
           $set: {
             approvalStatus,
             isAvailable,
+            pendingActivation: blockedByLimit,
             reviewedAt: new Date(),
             updatedAt: new Date(),
           },
@@ -1060,6 +1227,8 @@ app.patch(
       return res.status(200).send({
         success: true,
         message,
+        activated: updatedItem.isAvailable,
+        code: blockedByLimit ? "PREMIUM_REQUIRED" : undefined,
         approvalStatus: updatedItem.approvalStatus,
         isAvailable: updatedItem.isAvailable,
         activeItems,
@@ -1077,10 +1246,103 @@ app.patch(
   }
 )
 
+app.patch(
+  "/menu/:id/availability",
+  verifyToken,
+  requireRole("admin","vendor"),
+  async (req, res) => {
+    try {
+      const { id } = req.params
 
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ success: false, message: "Invalid menu item ID" })
+      }
 
+      if (typeof req.body?.isAvailable !== "boolean") {
+        return res.status(400).send({ success: false, message: "isAvailable must be true or false" })
+      }
 
+      const item = await menu.findOne({ _id: new ObjectId(id) })
 
+      if (!item) {
+        return res.status(404).send({ success: false, message: "Menu item not found" })
+      }
+      if (!isOwnerOrAdmin(req, item.vendorEmail || item.email)) {
+        return forbidden(res, "This is not your dish")
+      }
+      if (item.approvalStatus !== "approved") {
+        return res.status(409).send({
+          success: false,
+          message: "Only approved items can be activated or deactivated.",
+        })
+      }
+
+      // Deactivate: always allowed. Clear the flag so a later subscription
+      // does not switch this item back on.
+      if (req.body.isAvailable === false) {
+        await menu.updateOne(
+          { _id: item._id },
+          { $set: { isAvailable: false, pendingActivation: false, updatedAt: new Date() } }
+        )
+        return res.status(200).send({ success: true, isAvailable: false })
+      }
+
+      // Activate: check the vendor and the free limit
+      const vendorEmail = clean(item.vendorEmail || item.email).toLowerCase()
+
+      const vendorAccount = await user.findOne({ email: vendorEmail, role: "vendor" })
+
+      if (!vendorAccount) {
+        return res.status(404).send({ success: false, message: "Vendor account not found" })
+      }
+
+      if (vendorAccount.status === "blocked") {
+        return res.status(403).send({
+          success: false,
+          code: "ACCOUNT_BLOCKED",
+          message: "This vendor account is blocked",
+        })
+      }
+
+      if (!vendorAccount.premium) {
+        const activeItems = await menu.countDocuments({
+          $and: [
+            { $or: [{ vendorEmail }, { email: vendorEmail }] },
+            { approvalStatus: "approved", isAvailable: true },
+            { _id: { $ne: item._id } },
+          ],
+        })
+
+        if (activeItems >= FREE_ACTIVE_ITEM_LIMIT) {
+          // Remember it, so subscribing activates this item automatically
+          await menu.updateOne(
+            { _id: item._id },
+            { $set: { pendingActivation: true, updatedAt: new Date() } }
+          )
+
+          return res.status(403).send({
+            success: false,
+            code: "PREMIUM_REQUIRED",
+                        message:
+              req.user.role === "vendor"
+                ? `The Free plan allows only ${FREE_ACTIVE_ITEM_LIMIT} active items. Upgrade to Premium to activate more.`
+                : `Sorry, this vendor needs a Premium subscription to activate more than ${FREE_ACTIVE_ITEM_LIMIT} items.`,
+          })
+        }
+      }
+
+      await menu.updateOne(
+        { _id: item._id },
+        { $set: { isAvailable: true, pendingActivation: false, updatedAt: new Date() } }
+      )
+
+      return res.status(200).send({ success: true, isAvailable: true })
+    } catch (error) {
+      console.error("Availability error:", error)
+      return res.status(500).send({ success: false, message: "Failed to update availability" })
+    }
+  }
+)
 
 app.put("/menu/:id", verifyToken, requireRole("vendor", "admin"), async (req, res) => {
   try {
@@ -1322,12 +1584,31 @@ app.post('/payments/checkout-verify', verifyToken, requireRole('vendor'), async 
 
     const result = await transactions.insertOne(transaction)
     // Upgrade the account only after Stripe confirmed the payment
+    // if (account) {
+    //   await user.updateOne(accountQuery, {
+    //     $set: { premium: true, plan: 'premium', updatedAt: new Date() },
+    //   })
+    // }
+
+        // Upgrade the account only after Stripe confirmed the payment
     if (account) {
       await user.updateOne(accountQuery, {
         $set: { premium: true, plan: 'premium', updatedAt: new Date() },
       })
-    }
 
+      // Activate the items that were approved but blocked by the free limit
+      const vendorEmail = clean(account.email).toLowerCase()
+      await menu.updateMany(
+        {
+          $or: [{ vendorEmail }, { email: vendorEmail }],
+          approvalStatus: 'approved',
+          pendingActivation: true,
+        },
+        {
+          $set: { isAvailable: true, pendingActivation: false, updatedAt: new Date() },
+        }
+      )
+    }
     res.send({
       success: true,
       insertedId: result.insertedId,
@@ -1747,7 +2028,8 @@ app.get("/browse-menu", async (req, res) => {
   }
 })
 
-// ---------- GET /browse-menu/:id ----------
+// ---------- GET /
+
 // One approved dish, used by the details page
 app.get("/browse-menu/:id", async (req, res) => {
   try {
